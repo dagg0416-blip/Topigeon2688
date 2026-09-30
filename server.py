@@ -1,213 +1,67 @@
+"""2688 TOPIGEON proxy. No server-side persistent user data."""
 from flask import Flask, request, jsonify, send_from_directory
-import requests
-import re
+import requests, re
 from bs4 import BeautifulSoup
 from datetime import datetime
 
 app = Flask(__name__, static_folder='.')
-
 TOP = 'https://www.topigeon.com.tw/index.asp'
-
-HEAD = {
-    'User-Agent': (
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) '
-        'AppleWebKit/605.1.15 (KHTML, like Gecko) '
-        'Version/18.0 Mobile/15E148 Safari/604.1'
-    ),
-    'Referer': 'https://www.topigeon.com.tw/index.asp'
-}
+HEAD = {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1', 'Referer': TOP}
 
 
-def txt(resp):
-    """處理 TOPIGEON 舊網站中文字編碼"""
-    enc = resp.encoding
-
-    if not enc or enc.lower() in ('iso-8859-1', 'ascii'):
-        enc = resp.apparent_encoding or 'big5'
-
+def decode(response):
+    encoding = response.encoding
+    if not encoding or encoding.lower() in ('iso-8859-1', 'ascii'):
+        encoding = response.apparent_encoding or 'big5'
     try:
-        return resp.content.decode(enc, errors='replace')
-    except Exception:
-        return resp.content.decode('big5', errors='replace')
+        return response.content.decode(encoding, errors='replace')
+    except LookupError:
+        return response.content.decode('big5', errors='replace')
 
 
-def time_seconds(t):
-    """把 HH:MM:SS.xxx 轉成秒數"""
-    try:
-        p = t.split(':')
-        return (
-            int(p[0]) * 3600
-            + int(p[1]) * 60
-            + float(p[2])
-        )
-    except Exception:
-        return None
+def seconds(t):
+    h, m, s = t.split(':')
+    return int(h) * 3600 + int(m) * 60 + float(s)
 
 
-def parse_rows(html):
+def parse_rows(html, eligible=None):
+    """Keep earliest observed return for each eligible ring, regardless of hour.
+
+    Eligibility must come from an external-training participant list. Without
+    it, an afternoon-only home flight cannot reliably be distinguished from a
+    late external-training return; return such records for manual review.
     """
-    解析 2688 歸返資料。
-
-    重點：
-    TOPIGEON 同一天可能同時出現：
-    - 早上外訓 / 自訓
-    - 下午家飛
-
-    2688 分析只保留早上的自訓資料。
-    """
-
-    soup = BeautifulSoup(html, 'html.parser')
-    rows = []
-
-    # 格式：
-    # 序號1 / 序號2 / 鴿舍 / 環號 / 飛返時間
-    pattern = re.compile(
-        r'^\d{1,4}$'
-    )
-
-    for tr in soup.select('tr'):
-        cells = [
-            x.get_text(' ', strip=True)
-            for x in tr.select('td')
-        ]
-
-        if len(cells) < 5:
-            continue
-
-        # 嘗試在這一列中找 2688
-        try:
-            loft_index = cells.index('2688')
-        except ValueError:
-            continue
-
-        # 2688 前面至少需要兩個序號
-        # 後面需要環號與時間
-        if loft_index < 2 or loft_index + 2 >= len(cells):
-            continue
-
-        serial1 = cells[loft_index - 2].strip()
-        serial2 = cells[loft_index - 1].strip()
-        ring = cells[loft_index + 1].strip()
-        return_time = cells[loft_index + 2].strip()
-
-        if not pattern.match(serial1):
-            continue
-
-        if not pattern.match(serial2):
-            continue
-
-        if not re.match(
-            r'^\d{1,2}:\d{2}:\d{2}(?:\.\d+)?$',
-            return_time
-        ):
-            continue
-
-        seconds = time_seconds(return_time)
-
-        if seconds is None:
-            continue
-
-        rows.append({
-            'serial1': int(serial1),
-            'serial2': int(serial2),
-            'loft': '2688',
-            'ring': ring.zfill(2),
-            'return_time': return_time,
-            '_seconds': seconds
-        })
-
-    # -----------------------------
-    # 去除完全重複紀錄
-    # -----------------------------
-
-    unique = {}
-
-    for row in rows:
-        key = (
-            row['ring'],
-            row['return_time']
-        )
-
-        if key not in unique:
-            unique[key] = row
-
-    rows = list(unique.values())
-
-    # -----------------------------
-    # 排除下午家飛
-    #
-    # 目前 2688 的使用需求：
-    # 下午家飛不納入分析。
-    #
-    # 12:00 後的歸返紀錄先排除。
-    # -----------------------------
-
-    morning_rows = [
-        r for r in rows
-        if r['_seconds'] < 12 * 3600
-    ]
-
-    # 如果確實有早上紀錄，就採用早上這一批。
-    # 若某天完全沒有早上資料，不硬刪，
-    # 讓 API 回傳原始資料供診斷。
-    if morning_rows:
-        rows = morning_rows
-
-    # 同一羽若出現多次，只保留最早歸返
     by_ring = {}
-
-    for row in rows:
-        ring = row['ring']
-
-        if (
-            ring not in by_ring
-            or row['_seconds'] < by_ring[ring]['_seconds']
-        ):
-            by_ring[ring] = row
-
-    rows = list(by_ring.values())
-
-    # 依歸返時間，由早到晚
-    rows.sort(key=lambda x: x['_seconds'])
-
-    # 重新建立名次
-    for i, row in enumerate(rows, start=1):
-        row['serial1'] = i
-        row['serial2'] = i
-        row.pop('_seconds', None)
-
+    for tr in BeautifulSoup(html, 'html.parser').select('tr'):
+        cells = [td.get_text(' ', strip=True) for td in tr.select('td')]
+        for i, cell in enumerate(cells):
+            if cell != '2688' or i < 2 or i + 2 >= len(cells):
+                continue
+            s1, s2, ring, t = cells[i-2:i] + cells[i+1:i+3]
+            if not (re.fullmatch(r'\d{1,4}', s1) and re.fullmatch(r'\d{1,4}', s2)
+                    and re.fullmatch(r'\d{1,4}', ring)
+                    and re.fullmatch(r'\d{1,2}:\d{2}:\d{2}(?:\.\d+)?', t)):
+                continue
+            ring = ring.zfill(2)
+            if eligible is not None and ring not in eligible:
+                continue
+            stamp = seconds(t)
+            if ring not in by_ring or stamp < by_ring[ring]['_seconds']:
+                by_ring[ring] = {'ring': ring, 'return_time': t, '_seconds': stamp,
+                                 'loft': '2688', 'source_serial1': int(s1), 'source_serial2': int(s2)}
+    rows = sorted(by_ring.values(), key=lambda row: row['_seconds'])
+    for rank, row in enumerate(rows, 1):
+        row['serial1'] = rank
+        row['serial2'] = rank
+        del row['_seconds']
     return rows
 
 
 def extract_meta(html):
-    """嘗試取得施放地點與施放時間"""
-
-    soup = BeautifulSoup(html, 'html.parser')
-    body = soup.get_text(' ', strip=True)
-
-    release_place = ''
-    release_time = ''
-
-    place_patterns = [
-        r'施放地點\s*[:：]?\s*([^\s　]+)',
-        r'施放地\s*[:：]?\s*([^\s　]+)',
-    ]
-
-    for pat in place_patterns:
-        m = re.search(pat, body)
-        if m:
-            release_place = m.group(1).strip()
-            break
-
-    m = re.search(
-        r'施放時間\s*[:：]?\s*(\d{1,2}:\d{2}(?::\d{2})?)',
-        body
-    )
-
-    if m:
-        release_time = m.group(1)
-
-    return release_place, release_time
+    body = BeautifulSoup(html, 'html.parser').get_text(' ', strip=True)
+    place = re.search(r'施放(?:地點|地)\s*[:：]?\s*([^\s　]+)', body)
+    time = re.search(r'施放時間\s*[:：]?\s*(\d{1,2}:\d{2}(?::\d{2})?)', body)
+    return place.group(1) if place else '', time.group(1) if time else ''
 
 
 @app.get('/')
@@ -222,111 +76,47 @@ def health():
 
 @app.get('/api/topigeon')
 def topigeon():
-
-    date = (
-        request.args.get('date', '')
-        .strip()
-        .replace('-', '/')
-    )
-
-    passwd = request.args.get('pass', '').strip()
-
+    date = request.args.get('date', '').strip().replace('-', '/')
+    password = request.args.get('pass', '').strip()
     try:
         datetime.strptime(date, '%Y/%m/%d')
-    except Exception:
-        return jsonify(
-            error='日期格式需為 YYYY/MM/DD'
-        ), 400
-
-    # TOPIGEON 查詢條件
-    data = {
-        'QSysid': '1606',
-        'QMode': 'train',
-        'QRaceDate': date,
-        'QSite': '2688',
-        'QSiteCode': '2688',
-        'QSort': '1',
-        'qsize': '1000',
-        'QPass': passwd,
-        'p': 'N'
-    }
-
+    except ValueError:
+        return jsonify(error='日期格式需為 YYYY/MM/DD'), 400
+    # Optional comma-separated participant list; UI supplies this from roster.
+    participants = request.args.get('participants', '').strip()
+    eligible = None
+    if participants:
+        eligible = {x.zfill(2) for x in participants.split(',') if re.fullmatch(r'\d{1,4}', x)}
+        if not eligible:
+            return jsonify(error='參訓名單格式不正確'), 400
+    payload = {'QSysid': '1606', 'QMode': 'train', 'QRaceDate': date,
+               'QSite': '2688', 'QSiteCode': '2688', 'QSort': '1',
+               'qsize': '1000', 'QPass': password, 'p': 'N'}
     try:
-
-        with requests.Session() as s:
-
-            s.headers.update(HEAD)
-
-            # 先進首頁取得 Cookie / Session
-            s.get(
-                TOP,
-                timeout=20
-            )
-
-            # 再送查詢
-            r = s.post(
-                TOP,
-                data=data,
-                timeout=30
-            )
-
-            r.raise_for_status()
-
-            html = txt(r)
-
-        rows = parse_rows(html)
-
-        place, rtime = extract_meta(html)
-
+        with requests.Session() as session:
+            session.headers.update(HEAD)
+            session.get(TOP, timeout=20)
+            response = session.post(TOP, data=payload, timeout=30)
+            response.raise_for_status()
+            html = decode(response)
+        rows = parse_rows(html, eligible)
+        place, release_time = extract_meta(html)
         if not rows:
-
-            soup = BeautifulSoup(
-                html,
-                'html.parser'
-            )
-
-            page = soup.get_text(
-                ' ',
-                strip=True
-            )[:800]
-
-            return jsonify(
-                error=(
-                    'TOPIGEON 有回應，但沒有解析到 '
-                    '2688 的早上自訓紀錄。'
-                ),
-                diagnostic=page
-            ), 404
-
-        raw = '\n'.join(
-            f"{x['serial1']} "
-            f"{x['serial2']} "
-            f"2688 "
-            f"{x['ring']} "
-            f"{x['return_time']}"
-            for x in rows
-        )
-
-        return jsonify(
-            date=date,
-            count=len(rows),
-            rows=rows,
-            raw_text=raw,
-            release_place=place,
-            release_time=rtime,
-            filter='morning_training_only'
-        )
-
-    except requests.RequestException as e:
-
-        return jsonify(
-            error='連線 TOPIGEON 失敗',
-            detail=str(e)
-        ), 502
+            diagnostic = BeautifulSoup(html, 'html.parser').get_text(' ', strip=True)[:500]
+            return jsonify(error='TOPIGEON 有回應，但沒有符合條件的 2688 紀錄', diagnostic=diagnostic), 404
+        raw = '\n'.join(f"{r['serial1']} {r['serial2']} 2688 {r['ring']} {r['return_time']}" for r in rows)
+        return jsonify(date=date, count=len(rows), rows=rows, raw_text=raw,
+                       release_place=place, release_time=release_time,
+                       filter='first_return_per_eligible_ring_any_hour',
+                       warning=('未提供參訓名單，下午首次出現的家飛鴿可能混入，請人工核對。'
+                                if eligible is None else '依參訓名單篩選；請確認參訓勾選正確。'))
+    except requests.RequestException as exc:
+        return jsonify(error='連線 TOPIGEON 失敗', detail=str(exc)), 502
 
 
 if __name__ == '__main__':
-    app.run(
-        host='0.0.0.0',
-        port=8080
-    )
+    app.run(host='0.0.0.0', port=8080)
+
+@app.get('/history.json')
+def history_file():
+    return send_from_directory('.', 'history.json')
